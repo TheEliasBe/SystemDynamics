@@ -1,9 +1,9 @@
 import networkx as nx
 import json
-import matplotlib.pyplot as plt
+import msgfy
 import cexprtk
 import numpy as np
-import math
+import warnings
 import numpy.polynomial.polynomial as polynomial
 
 class SystemDynamicsEngine:
@@ -38,15 +38,22 @@ class SystemDynamicsEngine:
 
     # takes serialized graph json from from GoJS and returns a SD graph
     def from_json(self, json_string):
-        js = json.loads(json_string)
+        # check if input parameter is correct
+        if not type(json_string) == str:
+            raise Exception("Model JSON not provided as string object")
+        try:
+            js = json.loads(json_string)
+        except Exception as exc:
+            raise Exception("Could not parse JSON " + msgfy.to_error_message(exc))
+
         # first find all used variables and initialized them with 0
-        variables = set()
         for node in js['nodeDataArray']:
             if node['category'] == "variable" or node['category'] == 'data':
                 self.st.variables[node['key']] = 0
         self.st.variables['t'] = 0
         valve_formula = {}
 
+        # parse input
         for node in js["nodeDataArray"]:
             if node['category'] == "stock":
                 if not  "formula" in node:
@@ -55,17 +62,29 @@ class SystemDynamicsEngine:
                     node["negative"] = True
                 if len(node["formula"]) < 1:
                     node["formula"] = "0"
-                print(node["negative"])
-                self.st.variables[node['key']] = cexprtk.Expression(node["formula"], self.st).value()
+                # check if formula is valid
+                try:
+                    self.st.variables[node['key']] = cexprtk.Expression(node["formula"], self.st).value()
+                except Exception as exc:
+                    raise Exception("Formula at stock <i>" + str(node['key']) + "</i> could not be parsed. " + msgfy.to_error_message(exc))
                 self.G.add_node(node["key"], stock=True, formula=node["formula"], negative=node["negative"], label=node['label'])
             elif node['category'] == "cloud":
                 self.G.add_node(node["key"], initial_value=float("inf"))
             elif node['category'] == "valve":
                 if not "formula" in node:
                     node["formula"] = "0"
+                # check if formula is valid
+                try:
+                    cexprtk.Expression(str(node["formula"]), self.st).value()
+                except Exception as exc:
+                    raise Exception("Formula " + str(node["formula"]) + " at valve <i>" + str(node['key']) + "</i> could not be parsed. " + msgfy.to_error_message(exc))
                 valve_formula[node['key']] = node['formula']
                 self.G.add_node(node["key"], valve=True, formula=node["formula"], negative=False)
             elif node['category'] == "variable":
+                try:
+                    cexprtk.Expression(str(node["formula"]), self.st).value()
+                except Exception as exc:
+                    raise Exception("Formula " + str(node["formula"]) + " at variable <i>" + str(node['key']) + "</i> could not be parsed. " + msgfy.to_error_message(exc))
                 self.G.add_node(node["key"], formula=node['formula'], variable=True, negative=False)
                 self.st.variables[node["key"]] = float(cexprtk.Expression(node["formula"], self.st).value())
                 self.aux_variables[node["key"]] = node["formula"]
@@ -73,8 +92,11 @@ class SystemDynamicsEngine:
                 self.file_handlers[node['key']] = np.genfromtxt("user_provided_data/" + node['src']+".csv")
                 self.st.variables[node['key']] = 0
                 self.G.add_node(node["key"], data=True, source_file=node)
-            else:
+            elif node['category'] == "OfNodes":
+                # groups have no semantic meaning when simulating
                 pass
+            else:
+                raise Exception("Undefined node type <i>" + node['category'] + "<i>")
         # create flows
         for flow in js["linkDataArray"]:
             if flow['category'] == 'flow':
@@ -82,7 +104,7 @@ class SystemDynamicsEngine:
                 self.G.add_edge(flow["labelKeys"][0], flow["to"])
             elif flow['category'] == 'influence':
                 self.G.add_edge(flow["from"], flow["to"])
-        return True
+        return []
 
     def to_json(self):
         # TODO
@@ -194,15 +216,6 @@ class SystemDynamicsEngine:
 
         return (False, result_values)
 
-    def plot(self, polys, lower_bound=0, upper_bound=10, step=20):
-        ax = plt.subplot()
-        for p in polys:
-            values = polynomial.polyval(np.linspace(lower_bound, upper_bound, step), p)
-            x = np.arange(lower_bound, upper_bound, step)
-            ax.plot(values)
-        # ax.set_ylim(ymin=-2)
-        plt.show()
-
     # returns a array of simulated values for a certain stock over a certain period
     def eval_stock(self, key, lower_bound, upper_bound, precision=2):
         simulation_results = []
@@ -210,9 +223,6 @@ class SystemDynamicsEngine:
             flow = self.compute_flow_analytically(k, lower_bound, upper_bound, 10)
             simulation_results.append({"label": k, "values": list(np.round(flow, precision))})
         return simulation_results
-
-    def get_stocks_str(self):
-        return list(nx.get_node_attributes(self.G, 'stock').keys())
 
 
 
