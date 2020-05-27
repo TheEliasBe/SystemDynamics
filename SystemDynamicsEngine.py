@@ -66,7 +66,7 @@ class SystemDynamicsEngine:
                 try:
                     self.st.variables[node['key']] = cexprtk.Expression(node["formula"], self.st).value()
                 except Exception as exc:
-                    raise Exception("Formula at stock <i>" + str(node['key']) + "</i> could not be parsed. " + msgfy.to_error_message(exc))
+                    raise Exception("Formula at stock '" + str(node['key']) + "' could not be parsed. " + msgfy.to_error_message(exc))
                 self.G.add_node(node["key"], stock=True, formula=node["formula"], negative=node["negative"], label=node['label'])
             elif node['category'] == "cloud":
                 self.G.add_node(node["key"], initial_value=float("inf"))
@@ -77,7 +77,7 @@ class SystemDynamicsEngine:
                 try:
                     cexprtk.Expression(str(node["formula"]), self.st).value()
                 except Exception as exc:
-                    raise Exception("Formula " + str(node["formula"]) + " at valve <i>" + str(node['key']) + "</i> could not be parsed. " + msgfy.to_error_message(exc))
+                    raise Exception("Formula '" + str(node["formula"]) + "' at valve '" + str(node['key']) + "' could not be parsed. " + msgfy.to_error_message(exc))
                 valve_formula[node['key']] = node['formula']
                 self.G.add_node(node["key"], valve=True, formula=node["formula"], negative=False)
             elif node['category'] == "variable":
@@ -96,7 +96,7 @@ class SystemDynamicsEngine:
                 # groups have no semantic meaning when simulating
                 pass
             else:
-                raise Exception("Undefined node type <i>" + node['category'] + "<i>")
+                raise Exception("Undefined node type '" + node['category'] + "' in node " + str(node['label']))
         # create flows
         for flow in js["linkDataArray"]:
             if flow['category'] == 'flow':
@@ -109,6 +109,10 @@ class SystemDynamicsEngine:
     def to_json(self):
         # TODO
         pass
+
+    def from_networkx(self, networkx_model):
+        self.G = networkx_model
+
 
     def data_resizer(self, source_array, size, method):
         result_array = np.zeros(size)
@@ -142,7 +146,7 @@ class SystemDynamicsEngine:
         return result_array
 
 
-    def compute_flow_analytically(self, stock_key, t_0=0, upper_bound=5, delta_t=0.1):
+    def compute_flow_analytically(self, stock_key, t_0, upper_bound, delta_t):
         predecessors = list(self.G.predecessors(stock_key))
         successors = list(self.G.successors(stock_key))
         result_values = []
@@ -217,12 +221,15 @@ class SystemDynamicsEngine:
         return (False, result_values)
 
     # returns a array of simulated values for a certain stock over a certain period
-    def eval_stock(self, key, lower_bound, upper_bound, precision=2):
+    def eval_stock(self, keys, lower_bound=0, upper_bound=10, delta_t=1, precision=2):
         simulation_results = []
-        for k in key:
-            flow = self.compute_flow_analytically(k, lower_bound, upper_bound, 10)
+        for k in keys:
+            flow = self.compute_flow_analytically(k, t_0=lower_bound, upper_bound=upper_bound, delta_t=delta_t)
             simulation_results.append({"label": k, "values": list(np.round(flow, precision))})
         return simulation_results
+
+    def get_stocks_str(self):
+        return list(nx.get_node_attributes(self.G, 'stock').keys())
 
 
 
