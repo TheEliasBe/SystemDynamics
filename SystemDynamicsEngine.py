@@ -36,7 +36,7 @@ class SystemDynamicsEngine:
         return np.std(a)
 
 
-    # takes serialized graph json from from GoJS and returns a SD graph
+    # takes serialized graph json and returns a networkx SD graph
     def from_json(self, json_string):
         # check if input parameter is correct
         if not type(json_string) == str:
@@ -114,140 +114,18 @@ class SystemDynamicsEngine:
                 self.G.add_edge(flow["from"], flow["to"])
         return []
 
-
+    # get json representation for bms tool
     def to_json(self):
         # TODO
         pass
 
-
+    # create SD from networkx graph
     def from_networkx(self, networkx_model):
         self.G = networkx_model
-
-
-    def data_resizer(self, source_array, size, method):
-        result_array = np.zeros(size)
-        if method == "duplicate":
-            for i in range(size):
-                data_index = int(np.linspace(0, len(source_array)-1, size)[i])
-                result_array[i] = source_array[data_index]
-        elif method == "polyint":
-            x = np.linspace(0, len(source_array), len(source_array))
-            x_new = np.linspace(0, len(source_array), size)
-            data_poly = polynomial.polyfit(x=x, y=source_array, deg=max(3,len(source_array)//2))
-            result_array = polynomial.polyval(x_new, data_poly)
-        elif method == "padlast":
-            for i in range(size):
-                result_array[i] = source_array[-1]
-            pass
-        elif method == "padmean":
-            mean = np.mean(source_array)
-            for i in range(size):
-                if i < len(source_array):
-                    result_array[i] = source_array[i]
-                else:
-                    result_array[i] = mean
-            pass
-        elif method == "padzero":
-            for i in range(len(source_array)):
-                result_array[i] = source_array[i]
-        elif method == "reflect":
-            # TODO
-            pass
-        x = np.linspace(0, len(result_array)-1, len(result_array))
-        print(len(x), len(result_array))
-        result_coeff = polynomial.polyfit(x=x, y=result_array, deg=len(result_array)-1)
-        result_coeff_repr = []
-        for i, c in enumerate(result_coeff):
-            result_coeff_repr.append(str(c)+"*t^"+str(i))
-        return "+".join(result_coeff_repr)
-
-
-    def compute_flow_analytically(self, stock_key, t_0, upper_bound, delta_t):
-        predecessors = list(self.G.predecessors(stock_key))
-        successors = list(self.G.successors(stock_key))
-        result_values = []
-        number_of_increments = int(upper_bound / delta_t)
-
-        # set initial value for stock
-        result_values.append(cexprtk.Expression(self.G.nodes[stock_key]["formula"], self.st).value())
-
-        # re-size data sources
-        resized_data_arrays = {}
-        for key in self.file_handlers.keys():
-            resized_data_arrays[key] = self.data_resizer(self.file_handlers[key], number_of_increments, "polyint")
-
-        # resolve auxiliary variables
-        for s in successors + predecessors:
-            for v in self.aux_variables.keys():
-                if v in self.G.nodes[s]["formula"]:
-                    self.G.nodes[s]["formula"] = self.G.nodes[s]["formula"].replace(v, self.G.nodes[v]['formula'])
-
-        # set noise generators
-        for s in successors + predecessors:
-            for v in self.random_generators.keys():
-                self.st.variables[v] = np.random.normal(1,0)
-
-        for i in range(number_of_increments)[1:]:
-            self.st.variables['t'] = t_0 + i * delta_t
-            inflow_value = 0
-            outflow_value = 0
-            # update external data values
-            for d in self.file_handlers.keys():
-                self.st.variables[d] = resized_data_arrays[d][i]
-
-            # set value of stock as variables
-            self.st.variables[stock_key] = result_values[i-1]
-            for k in successors:
-                k = next(self.G.successors(k))
-                self.st.variables[k] = self.compute_flow_analytically(k, t_0, t_0 + i * delta_t, delta_t)[1][-1]
-
-            # accumulated inflow
-            for p in predecessors:
-                predecessors_inflow = cexprtk.Expression(self.G.nodes[p]["formula"], self.st).value()
-                predecessor_stock_key = next(self.G.predecessors(p))
-                predecessor_stock_value = self.compute_flow_analytically(predecessor_stock_key, t_0, t_0 + i * delta_t, delta_t)
-
-                # preceding stock is allowed to go negative, just add the inflow
-                if self.G.nodes[predecessor_stock_key]["negative"] == True:
-                    inflow_value += predecessors_inflow
-                else:
-                # preceeding stock is not allowed to go negative
-                # check if stock would pass 0
-                    if predecessor_stock_value[0] == True:
-                        # preceding stock went negative, no inflow from that stock
-                        inflow_value += 0
-                    elif predecessor_stock_value[1][-1] >= predecessors_inflow:
-                        # preceding stock is positive and value greater than flow
-                        inflow_value += predecessors_inflow
-                    elif predecessor_stock_value[1][-1] < predecessors_inflow:
-                        # preceding stock is positive but value is smaller than flow -> limit flow to current value
-                        inflow_value += predecessor_stock_value[1][-1]
-
-            # accumulate outflow
-            for s in successors:
-                outflow_value += cexprtk.Expression(self.G.nodes[s]["formula"], self.st).value()
-
-            # compute the net inflow to this stock
-            net_flow = result_values[i-1] + inflow_value*delta_t - outflow_value*delta_t
-
-            # check if this stock is allowed to be negative
-            if self.G.nodes[stock_key]["negative"]:
-                result_values.append(net_flow)
-            else:
-                if net_flow > 0:
-                    result_values.append(net_flow)
-                else:
-                    return (True, result_values)
-
-        return (False, result_values)
 
     # returns list of all stock keys in the model as strings
     def get_stocks_str(self):
         return list(nx.get_node_attributes(self.G, 'stock').keys())
-
-    def function_evaluator(self, t, expr_str):
-        self.st.variables['t'] = t
-        return cexprtk.Expression(expr_str, self.st).value()
 
     # initializes stocks and flows from the graph
     def init_sd(self, lower_bound, upper_bound, delta_t, output_stock_key):
@@ -292,14 +170,15 @@ class Engine:
 
 
     def flow(self, key, f, start=None, end=None):
-        self.__new_state_var(key, cexprtk.Expression(f, self.st).value())
-        s = self.ix[start] if start is not None else None
-        e = self.ix[end] if end is not None else None
         # resolve any data sources in formula
         for k, v in self.data.items():
             if k in f:
                 f = f.replace(k, v)
+        self.__new_state_var(key, cexprtk.Expression(f, self.st).value())
+        s = self.ix[start] if start is not None else None
+        e = self.ix[end] if end is not None else None
         # add flows to dict
+        print(f)
         self.flows[key] = {'f': f, 'start': s, 'end': e}
 
     def xdot(self, y, t):
@@ -333,7 +212,10 @@ class Engine:
     def stocks(self, icdict):
         for k, v in icdict.items():
             # initialize stock values as variables in formulas
-            self.st.variables[k] = v
+            if type(v) == int:
+                self.st.variables[k] = v
+            elif type(v) == str:
+                self.st.variables[k] = cexprtk.Expression(v, self.st).value()
             self.__new_state_var(k, v)
             self.stock[k] = v
 
@@ -346,8 +228,7 @@ class Engine:
         # key (label) value (source file)
         for k, v in icdict.items():
             data_np_array = np.genfromtxt("user_provided_data/" + v)
-
-            self.data[k] = v
+            self.data[k] = self.data_interpolation(data_np_array)
 
 
     def __getattr__(self, key):
@@ -372,4 +253,57 @@ class Engine:
         self.__validate_key(key)
         self.current.append(IC)
         self.ix[key] = len(self.current) - 1
+
+    def data_interpolatio(self, source_array, size, method):
+        result_array = np.zeros(size)
+        if method == "duplicate":
+            for i in range(size):
+                data_index = int(np.linspace(0, len(source_array)-1, size)[i])
+                result_array[i] = source_array[data_index]
+        elif method == "polyint":
+            x = np.linspace(0, len(source_array), len(source_array))
+            x_new = np.linspace(0, len(source_array), size)
+            data_poly = polynomial.polyfit(x=x, y=source_array, deg=max(3,len(source_array)//2))
+            result_array = polynomial.polyval(x_new, data_poly)
+        elif method == "padlast":
+            for i in range(size):
+                result_array[i] = source_array[-1]
+            pass
+        elif method == "padmean":
+            mean = np.mean(source_array)
+            for i in range(size):
+                if i < len(source_array):
+                    result_array[i] = source_array[i]
+                else:
+                    result_array[i] = mean
+            pass
+        elif method == "padzero":
+            for i in range(len(source_array)):
+                result_array[i] = source_array[i]
+        elif method == "reflect":
+            # TODO
+            pass
+        print(np.round(result_array,2))
+        x = np.linspace(0, len(result_array)-1, len(result_array))
+        result_coeff = polynomial.polyfit(x=x, y=result_array, deg=10)
+        result_coeff_repr = []
+        for i, c in enumerate(result_coeff):
+            result_coeff_repr.append(str(c)+"*t^"+str(i))
+        return "+".join(result_coeff_repr)
+
+    def data_interpolation(self, source_array):
+        print(len(self.t))
+        print(self.t)
+        # stretch interpolation nodes to new interval if necessary
+        x = np.linspace(0, self.t[-1], len(source_array))
+        # apply polynomial interpolation
+        data_poly = polynomial.polyfit(x=x, y=source_array, deg=min(10,max(3, len(source_array) // 2)))
+        # create formula as string
+        data_poly = np.round(data_poly, 4)
+        result_coeff_repr = []
+        for i, c in enumerate(data_poly):
+            result_coeff_repr.append(str(c)+"*t^"+str(i))
+        interpolation_formula = '+'.join(result_coeff_repr)
+        return interpolation_formula
+
 
