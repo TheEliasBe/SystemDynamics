@@ -10,6 +10,7 @@ Install required Python packages:
 - cexprtk
 - numpy
 - matplotlib
+- msgfy
 
 Clone repository into your project
 
