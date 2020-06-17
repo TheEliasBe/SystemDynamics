@@ -5,6 +5,7 @@ import cexprtk
 import numpy as np
 from scipy.integrate import odeint
 import numpy.polynomial.polynomial as polynomial
+import Intersection
 
 class SystemDynamicsEngine:
 
@@ -69,7 +70,7 @@ class SystemDynamicsEngine:
                     raise Exception("Formula at stock '" + str(node['key']) + "' could not be parsed. " + msgfy.to_error_message(exc))
                 self.G.add_node(node["key"], stock=True, formula=node["formula"], negative=node["negative"], label=node['label'], limit=100)
             elif node['category'] == "cloud":
-                self.G.add_node(node["key"], initial_value=float("inf"))
+                self.G.add_node(node["key"], cloud=True, initial_value=float("inf"))
             elif node['category'] == "valve":
                 if not "formula" in node:
                     node["formula"] = "0"
@@ -90,7 +91,7 @@ class SystemDynamicsEngine:
                 self.aux_variables[node["key"]] = node["formula"]
             elif node['category'] == "data":
                 try:
-                    self.file_handlers[node['key']] = np.genfromtxt("user_provided_data/" + node['src']+".csv")
+                    self.file_handlers[node['key']] =  node['src']+".csv"
                     self.st.variables[node['key']] = 0
                 except Exception as ecx:
                     pass
@@ -111,7 +112,8 @@ class SystemDynamicsEngine:
             if flow['category'] == 'flow':
                 self.G.add_edge(flow["from"], flow["to"], formula=valve_formula[flow["labelKeys"][0]])
             elif flow['category'] == 'influence':
-                self.G.add_edge(flow["from"], flow["to"])
+                # self.G.add_edge(flow["from"], flow["to"])
+                pass
         return []
 
     # get json representation for bms tool
@@ -127,9 +129,43 @@ class SystemDynamicsEngine:
     def get_stocks_str(self):
         return list(nx.get_node_attributes(self.G, 'stock').keys())
 
+    def get_stocks_key_label_str(self):
+        r = []
+        for stock_key in self.get_stocks_str():
+            r.append((stock_key, self.G.nodes[stock_key]["label"]))
+        return r
+
+    def get_variables_str(self):
+        return list(nx.get_node_attributes(self.G, 'variable').keys())
+
+    def run_simulations(self, lower_bound, upper_bound, delta_t, output_stock_keys, discrete):
+        r = []
+        # run simulations for each stock
+        for s in output_stock_keys:
+            r.append(self.init_sd(lower_bound, upper_bound, delta_t, s, discrete))
+        # find intersections
+        # if len(output_stock_keys) > 1:
+        #     x12 = np.arange(lower_bound, upper_bound, delta_t)
+        #     x,y = Intersection.intersection(x12, r[0]['values'], x12, r[1]['values'])
+        #     x = x / delta_t
+        #     x = x + 1
+        #     x = x.tolist()
+        #     y = y.tolist()
+        #     return r, x, y
+        return r
+
     # initializes stocks and flows from the graph
-    def init_sd(self, lower_bound, upper_bound, delta_t, output_stock_key):
+    def init_sd(self, lower_bound, upper_bound, delta_t, output_stock_key, discrete):
         eng = Engine(t = np.arange(lower_bound, upper_bound, delta_t))
+        # add variables to sd engine
+        for variable_key in self.get_variables_str():
+            print(variable_key, " ", self.G.nodes[variable_key]["formula"])
+            eng.variables({variable_key: cexprtk.Expression(self.G.nodes[variable_key]["formula"], self.st).value()})
+
+        # add data sources to the engine{variable_key:
+        for label, path in self.file_handlers.items():
+            eng.datasources({label: path})
+
         # add stocks to SD engine
         for stock_key in self.get_stocks_str():
             eng.stocks({stock_key: cexprtk.Expression(self.G.nodes[stock_key]["formula"], self.st).value()})
@@ -139,10 +175,22 @@ class SystemDynamicsEngine:
             from_node = edge[0]
             to_node = edge[1]
             formula = edge[2]['formula']
+
+            if "cloud" in self.G.nodes[from_node]:
+                from_node = None
+            if "cloud" in self.G.nodes[to_node]:
+                to_node = None
             eng.flow(key='f'+str(i), start=from_node, end=to_node, f=formula)
 
-        eng.run()
-        return [{"label": output_stock_key, "values": list(eng.get_result(output_stock_key))}]
+        eng.run(discrete=discrete)
+        run_result = list(eng.get_result(output_stock_key))
+        x_max_index = np.where(run_result == np.amax(run_result))[0]
+        y_max = float(np.amax(run_result))
+        x_min_index = np.where(run_result == np.amin(run_result))[0].tolist()
+        y_min = float(np.amin(run_result))
+        x_max_index = x_max_index + 1
+        x_max_index = x_max_index.tolist()
+        return {"label": self.G.nodes[output_stock_key]["label"], "values": run_result, "y_max": y_max, "x_max_index": x_max_index, "y_min": y_min, "x_min_index": x_min_index}
 
 
 class Engine:
@@ -174,11 +222,11 @@ class Engine:
         for k, v in self.data.items():
             if k in f:
                 f = f.replace(k, v)
+
         self.__new_state_var(key, cexprtk.Expression(f, self.st).value())
         s = self.ix[start] if start is not None else None
         e = self.ix[end] if end is not None else None
         # add flows to dict
-        print(f)
         self.flows[key] = {'f': f, 'start': s, 'end': e}
 
     def xdot(self, y, t):
@@ -212,10 +260,12 @@ class Engine:
     def stocks(self, icdict):
         for k, v in icdict.items():
             # initialize stock values as variables in formulas
-            if type(v) == int:
+            if type(v) == int or type(v) == float:
                 self.st.variables[k] = v
             elif type(v) == str:
                 self.st.variables[k] = cexprtk.Expression(v, self.st).value()
+            else:
+                pass
             self.__new_state_var(k, v)
             self.stock[k] = v
 
@@ -227,7 +277,7 @@ class Engine:
     def datasources(self, icdict):
         # key (label) value (source file)
         for k, v in icdict.items():
-            data_np_array = np.genfromtxt("user_provided_data/" + v)
+            data_np_array = np.genfromtxt(v)
             self.data[k] = self.data_interpolation(data_np_array)
 
 
@@ -283,7 +333,6 @@ class Engine:
         elif method == "reflect":
             # TODO
             pass
-        print(np.round(result_array,2))
         x = np.linspace(0, len(result_array)-1, len(result_array))
         result_coeff = polynomial.polyfit(x=x, y=result_array, deg=10)
         result_coeff_repr = []
@@ -292,8 +341,6 @@ class Engine:
         return "+".join(result_coeff_repr)
 
     def data_interpolation(self, source_array):
-        print(len(self.t))
-        print(self.t)
         # stretch interpolation nodes to new interval if necessary
         x = np.linspace(0, self.t[-1], len(source_array))
         # apply polynomial interpolation
