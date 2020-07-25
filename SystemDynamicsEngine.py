@@ -49,7 +49,7 @@ class SystemDynamicsEngine:
 
         # first find all used variables and initialized them with 0
         for node in js['nodeDataArray']:
-            if node['category'] == "variable" or node['category'] == 'data':
+            if node['category'] == "variable" or node['category'] == 'data' or node['category'] == 'noise':
                 self.st.variables[node['key']] = 0
         self.st.variables['t'] = 0
         valve_formula = {}
@@ -57,12 +57,10 @@ class SystemDynamicsEngine:
         # parse input
         for node in js["nodeDataArray"]:
             if node['category'] == "stock":
-                if not  "formula" in node:
-                    node["formula"] = "0"
-                if not  "negative" in node:
-                    node["negative"] = True
-                if len(node["formula"]) < 1:
-                    node["formula"] = "0"
+                if not "initialvalue" in node:
+                    node["initialvalue"] = "0"
+                if len(node["initialvalue"]) < 1:
+                    node["initialvalue"] = "0"
                 # check if formula is valid
                 try:
                     self.st.variables[node['key']] = cexprtk.Expression(node["formula"], self.st).value()
@@ -76,11 +74,11 @@ class SystemDynamicsEngine:
                     node["formula"] = "0"
                 # check if formula is valid
                 try:
-                    cexprtk.Expression(str(node["formula"]), self.st).value()
+                    cexprtk.Expression(str(node["flowformula"]), self.st).value()
                 except Exception as exc:
-                    raise Exception("Formula '" + str(node["formula"]) + "' at valve '" + str(node['key']) + "' could not be parsed. " + msgfy.to_error_message(exc))
-                valve_formula[node['key']] = node['formula']
-                self.G.add_node(node["key"], valve=True, formula=node["formula"], negative=False)
+                    raise Exception("Formula '" + str(node["flowformula"]) + "' at valve '" + str(node['key']) + "' could not be parsed. " + msgfy.to_error_message(exc))
+                valve_formula[node['key']] = node['flowformula']
+                self.G.add_node(node["key"], valve=True, formula=node["flowformula"], negative=False)
             elif node['category'] == "variable":
                 try:
                     cexprtk.Expression(str(node["formula"]), self.st).value()
@@ -102,8 +100,11 @@ class SystemDynamicsEngine:
             elif node['category'] == "Comment":
                 # comments have no semantic meaning when simulating
                 pass
-            elif node['category'] == "noise":
-                # TODO
+            elif node['category'].lower() == "noise":
+                print("Added noise " + node['key'])
+                self.random_generators[node['key']] = ("normal",0,1,node['seed'])
+                self.st.variables[node['key']] = 0
+                self.G.add_node(node["key"], noise=True)
                 pass
             else:
                 raise Exception("Undefined node type '" + node['category'] + "' in node " + str(node['label']))
@@ -137,6 +138,7 @@ class SystemDynamicsEngine:
 
     def get_variables_str(self):
         return list(nx.get_node_attributes(self.G, 'variable').keys())
+        # return self.st.variables
 
     def run_simulations(self, lower_bound, upper_bound, delta_t, output_stock_keys, discrete):
         r = []
@@ -144,14 +146,14 @@ class SystemDynamicsEngine:
         for s in output_stock_keys:
             r.append(self.init_sd(lower_bound, upper_bound, delta_t, s, discrete))
         # find intersections
-        # if len(output_stock_keys) > 1:
-        #     x12 = np.arange(lower_bound, upper_bound, delta_t)
-        #     x,y = Intersection.intersection(x12, r[0]['values'], x12, r[1]['values'])
-        #     x = x / delta_t
-        #     x = x + 1
-        #     x = x.tolist()
-        #     y = y.tolist()
-        #     return r, x, y
+        if len(output_stock_keys) > 1:
+            x12 = np.arange(lower_bound, upper_bound, delta_t)
+            x,y = Intersection.intersection(x12, r[0]['values'], x12, r[1]['values'])
+            x = x / delta_t
+            x = x + 1
+            x = x.tolist()
+            y = y.tolist()
+            return r, x, y
         return r
 
     # initializes stocks and flows from the graph
@@ -159,10 +161,18 @@ class SystemDynamicsEngine:
         eng = Engine(t = np.arange(lower_bound, upper_bound, delta_t))
         # add variables to sd engine
         for variable_key in self.get_variables_str():
+            print(self.G.nodes)
             print(variable_key, " ", self.G.nodes[variable_key]["formula"])
             eng.variables({variable_key: cexprtk.Expression(self.G.nodes[variable_key]["formula"], self.st).value()})
 
-        # add data sources to the engine{variable_key:
+        # initialize noise generators
+        for label, kind in self.random_generators.items():
+            expected_value = kind[1]
+            variance = kind[2]
+            seed = kind[3]
+            eng.noise_generators({label: (expected_value, variance, seed)})
+
+        # add data sources to the engine variable_key:
         for label, path in self.file_handlers.items():
             eng.datasources({label: path})
 
@@ -194,6 +204,8 @@ class SystemDynamicsEngine:
 
 
 class Engine:
+
+
     def __init__(self, t):
         # simulation time steps as np-array
         self.t = t
@@ -215,6 +227,14 @@ class Engine:
         self.st.variables['t'] = 0
         # stores all data source variables (variable_key, formula)
         self.data = {}
+        # stores all random number sequences for noise generators
+        self.noise = {}
+
+        def random_series(t, s):
+            np.random.seed(int(t) + int(s))
+            return np.random.normal()
+
+        self.st.functions['random'] = random_series
 
 
     def flow(self, key, f, start=None, end=None):
@@ -223,14 +243,20 @@ class Engine:
             if k in f:
                 f = f.replace(k, v)
 
+        for k, v  in self.noise.items():
+            if k in f:
+                f = f.replace(k, "random(t,"+str(v)+")")
+
+        # resolve noise in formula
+
         self.__new_state_var(key, cexprtk.Expression(f, self.st).value())
         s = self.ix[start] if start is not None else None
         e = self.ix[end] if end is not None else None
         # add flows to dict
         self.flows[key] = {'f': f, 'start': s, 'end': e}
 
-    def xdot(self, y, t):
-        self.current = y
+    def f(self, y, t):
+        self.current = y # set y to the initial condition
         d = np.zeros((len(y),))
         for k, f in self.flows.items():  # calculate flows only once. distribute to stocks.
             i = self.ix[k]
@@ -239,6 +265,10 @@ class Engine:
             # update all stock variables
             for k,v in self.stock.items():
                 self.st.variables[k] = self.get_stock_value(k)
+            # update noise generators
+            current_time_step_index = np.where(self.t == t)[0]
+
+
             ft = cexprtk.Expression(f['f'], self.st).value()
             d[i] = ft - self.current[i]
             if f['start'] is not None: d[f['start']] -= ft
@@ -248,12 +278,13 @@ class Engine:
     def run(self, discrete=False):
         self.done = False
         if not discrete:
-            self.results = odeint(self.xdot, self.current, self.t)
+            # odeint(f(y,t), initial condition, sequence of points)
+            self.results = odeint(self.f, self.current, self.t)
         else:
             self.results = np.zeros((len(self.t), len(self.current)))
             self.results[0, :] = self.current
             for i in np.arange(1, len(self.t)):
-                self.results[i, :] = self.results[i - 1, :] + self.xdot(self.results[i - 1, :], self.t[i])
+                self.results[i, :] = self.results[i - 1, :] + self.f(self.results[i - 1, :], self.t[i])
         self.done = True
         self.current = self.results[0, :]  # restore initial conditions
 
@@ -270,6 +301,7 @@ class Engine:
             self.stock[k] = v
 
     def variables(self, icdict):
+        self.st.variables['rand'] = 0
         for k, v in icdict.items():
             # initializes variables as variables in formulas
             self.st.variables[k] = v
@@ -280,6 +312,13 @@ class Engine:
             data_np_array = np.genfromtxt(v)
             self.data[k] = self.data_interpolation(data_np_array)
 
+    def noise_generators(self, icdict):
+        # key (label) value (source file)
+        for k, v in icdict.items():
+            expected_value = v[0]
+            variance = v[1]
+            seed = v[2]
+            self.noise[k] = seed
 
     def __getattr__(self, key):
         if not self.done:
@@ -352,5 +391,8 @@ class Engine:
             result_coeff_repr.append(str(c)+"*t^"+str(i))
         interpolation_formula = '+'.join(result_coeff_repr)
         return interpolation_formula
+
+
+
 
 
